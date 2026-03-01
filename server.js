@@ -1,3 +1,5 @@
+const path = require("path");
+const fs = require("fs").promises;
 /**
  * Ultimate Ecosystem Sync Server v3
  * PostgreSQL persistence — Railway ready
@@ -410,6 +412,73 @@ app.get('/sync/song-library', (req, res) => {
 
 // ── GET /sync/debug ──────────────────────────────────────────────────────────
 app.get('/sync/debug', (req, res) => res.json({
+
+// ── POST /sync/stems/zip ─────────────────────────────────────────────────────
+const multer = require("multer");
+const upload = multer({ storage: multer.memoryStorage() });
+app.post("/sync/stems/zip", upload.single("zip"), async (req, res) => {
+  try {
+    const { songId, title, artist } = req.body;
+    if (!req.file) return res.status(400).json({ error: "No ZIP file uploaded" });
+    
+    const JSZip = require("jszip");
+    const zip = await JSZip.loadAsync(req.file.buffer);
+    const files = Object.keys(zip.files).filter(name => 
+      !zip.files[name].dir &&
+      /\.(wav|mp3|flac|aiff)$/i.test(name)
+    );
+    
+    const stemsDir = path.join(__dirname, "uploads", "stems", songId || `song-${Date.now()}`);
+    await fs.mkdir(stemsDir, { recursive: true });
+    
+    const STEM_PATTERNS = {
+      vocals: /(vox|vocals|vocal|lead|bv)/i,
+      drums: /(drums|drum|kick|snare|hat|perc)/i,
+      bass: /(bass|bassline|sub|lowend)/i,
+      keys: /(keys|keyboard|piano|synth|organ)/i,
+      guitars: /(guitar|guitars|electric|acoustic)/i,
+      other: /(other|misc|fx|effects)/i,
+    };
+    
+    function detectStemType(filename) {
+      const name = filename.toLowerCase().replace(/[^a-z0-9]/g, "");
+      for (const [stem, pattern] of Object.entries(STEM_PATTERNS)) {
+        if (pattern.test(name)) return stem.toUpperCase();
+      }
+      return "OTHER";
+    }
+    
+    const stems = [];
+    for (const filename of files) {
+      const stemType = detectStemType(filename);
+      const clean = path.basename(filename).replace(/[^a-zA-Z0-9]/g, "_");
+      const ext = path.extname(filename);
+      const localPath = path.join(stemsDir, `${stemType}_${clean}${ext}`);
+      
+      const buffer = await zip.files[filename].async("nodebuffer");
+      await fs.writeFile(localPath, buffer);
+      
+      stems.push({
+        type: stemType,
+        name: path.basename(filename, ext),
+        url: `/uploads/stems/${path.basename(stemsDir)}/${path.basename(localPath)}`,
+        localPath,
+      });
+    }
+    
+    res.status(200).json({
+      id: songId || path.basename(stemsDir),
+      title: title || "ZIP Stems Import",
+      artist: artist || "Unknown",
+      status: "COMPLETED",
+      result: { stems, sections: [], chords: [] },
+    });
+  } catch (err) {
+    console.error("[ZIP_ERROR]", err);
+    res.status(500).json({ error: "Failed to process ZIP", details: err.message });
+  }
+});
+
   people: store.people, services: store.services, plans: store.plans,
 }));
 
