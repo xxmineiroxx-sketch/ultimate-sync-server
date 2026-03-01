@@ -8,10 +8,11 @@ const cors    = require('cors');
 const { Pool } = require('pg');
 
 const PORT = process.env.PORT || 8099;
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
+const DB_URL = process.env.DATABASE_URL || '';
+const pool = DB_URL ? new Pool({
+  connectionString: DB_URL,
   ssl: { rejectUnauthorized: false },
-});
+}) : null;
 
 // ── In-memory store (warm cache) ────────────────────────────────────────────
 let store = {
@@ -22,6 +23,10 @@ let store = {
 
 // ── PostgreSQL persistence ───────────────────────────────────────────────────
 async function initDB() {
+  if (!pool) {
+    console.log('[boot] No DATABASE_URL — running in-memory only (data will not persist across restarts)');
+    return;
+  }
   await pool.query(`
     CREATE TABLE IF NOT EXISTS sync_store (
       id   TEXT PRIMARY KEY DEFAULT 'main',
@@ -39,11 +44,12 @@ async function initDB() {
     if (!store.songLibrary)         store.songLibrary         = {};
     console.log(`[boot] Loaded: ${store.services.length} services, ${store.people.length} people`);
   } else {
-    console.log('[boot] Fresh start');
+    console.log('[boot] Fresh DB — ready');
   }
 }
 
 async function persist() {
+  if (!pool) return; // in-memory mode
   await pool.query(
     `INSERT INTO sync_store (id, data) VALUES ('main', $1)
      ON CONFLICT (id) DO UPDATE SET data = $1`,
@@ -415,7 +421,7 @@ app.get('/sync/status', (req, res) => res.json({
   plans:    Object.keys(store.plans).length,
 }));
 
-app.get('/health', (req, res) => res.json({ status: 'ok', service: 'UltimateSync', version: '3.0.0' }));
+app.get('/health', (req, res) => res.json({ status: 'ok', service: 'UltimateSync', version: '3.0.0', db: pool ? 'postgres' : 'memory' }));
 
 // ── Boot ─────────────────────────────────────────────────────────────────────
 initDB().then(() => {
