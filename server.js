@@ -1,5 +1,6 @@
 const path = require("path");
 const fs = require("fs").promises;
+const http = require('http');
 /**
  * Ultimate Ecosystem Sync Server v3
  * PostgreSQL persistence — Railway ready
@@ -9,12 +10,34 @@ const express = require('express');
 const cors    = require('cors');
 const { Pool } = require('pg');
 
+// ── WebSocket (MIDI bridge) — optional, graceful if ws not installed ──────────
+let WebSocket, wss;
+const wsClients = new Set();
+try {
+  WebSocket = require('ws');
+} catch { console.log('[MIDI] ws package not found — run: npm install ws  in UltimateSyncServer/'); }
+
 const PORT = process.env.PORT || 8099;
 const DB_URL = process.env.DATABASE_URL || '';
 const pool = DB_URL ? new Pool({
   connectionString: DB_URL,
   ssl: { rejectUnauthorized: false },
 }) : null;
+
+// ── File-based persistence (fallback when no DATABASE_URL) ───────────────────
+const STORE_FILE = path.join(__dirname, 'store.json');
+
+async function loadFromFile() {
+  try {
+    const raw = await fs.readFile(STORE_FILE, 'utf8');
+    return JSON.parse(raw);
+  } catch { return null; }
+}
+
+async function saveToFile() {
+  if (pool) return; // using postgres — skip file
+  try { await fs.writeFile(STORE_FILE, JSON.stringify(store)); } catch {}
+}
 
 // ── In-memory store (warm cache) ────────────────────────────────────────────
 let store = {
@@ -26,7 +49,19 @@ let store = {
 // ── PostgreSQL persistence ───────────────────────────────────────────────────
 async function initDB() {
   if (!pool) {
-    console.log('[boot] No DATABASE_URL — running in-memory only (data will not persist across restarts)');
+    // Try loading from file first
+    const saved = await loadFromFile();
+    if (saved) {
+      store = { ...store, ...saved };
+      if (!store.grants)              store.grants              = {};
+      if (!store.proposals)           store.proposals           = [];
+      if (!store.blockouts)           store.blockouts           = [];
+      if (!store.assignmentResponses) store.assignmentResponses = {};
+      if (!store.songLibrary)         store.songLibrary         = {};
+      console.log(`[boot] Loaded from file: ${store.services.length} services, ${store.people.length} people, ${Object.keys(store.songLibrary).length} songs`);
+    } else {
+      console.log('[boot] No DATABASE_URL — fresh in-memory store');
+    }
     return;
   }
   await pool.query(`
@@ -51,7 +86,7 @@ async function initDB() {
 }
 
 async function persist() {
-  if (!pool) return; // in-memory mode
+  if (!pool) { await saveToFile(); return; }
   await pool.query(
     `INSERT INTO sync_store (id, data) VALUES ('main', $1)
      ON CONFLICT (id) DO UPDATE SET data = $1`,
@@ -60,26 +95,81 @@ async function persist() {
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
-function findPerson(email) {
-  if (!email) return null;
-  const q = email.trim().toLowerCase();
-  const namePrefix = q.split('@')[0].replace(/[._]/g, ' ');
+// Collapse consecutive duplicate letters: "jefferson" → "jeferson"
+function normName(s) { return s.replace(/(.)\1+/g, '$1'); }
+
+function findPerson(email, name) {
+  if (!email && !name) return null;
+  const q  = (email || '').trim().toLowerCase();
+  const qn = (name  || '').trim().toLowerCase();
+  const namePrefix = q ? q.split('@')[0].replace(/[._\d]/g, ' ').trim() : '';
   return store.people.find(p => {
     const pe = (p.email || '').toLowerCase();
     const pn = (p.name  || '').toLowerCase();
-    return pe === q || pn === q || pn === namePrefix;
+    if (q && pe === q) return true;
+    if (q && pn === q) return true;
+    if (namePrefix.length > 3 && pn === namePrefix) return true;
+    if (qn) {
+      if (pn === qn) return true;
+      // Last name + normalized first name: "Jeferson Nascimento" ↔ "Jefferson Nascimento"
+      // normName collapses double letters so "jefferson"→"jeferson" === "jeferson"
+      const qParts = qn.split(/\s+/);
+      const pParts = pn.split(/\s+/);
+      if (qParts.length >= 2 && pParts.length >= 2) {
+        const qLast = qParts[qParts.length - 1];
+        const pLast = pParts[pParts.length - 1];
+        if (qLast.length >= 4 && qLast === pLast) {
+          // Last names match — also check first name via dedup-normalization
+          if (normName(qParts[0]) === normName(pParts[0])) return true;
+        }
+      }
+    }
+    return false;
   }) || null;
 }
 
 // ── Express app ──────────────────────────────────────────────────────────────
-const app = express();
+const app        = express();
+const httpServer = http.createServer(app);
 app.use(express.json());
 app.use(cors());
+
+// ── Static audio assets (PADS + Guides) ──────────────────────────────────────
+app.use('/pads',   express.static('/Users/studio/Downloads/PADS',            { setHeaders: (res) => res.set('Access-Control-Allow-Origin', '*') }));
+app.use('/guides', express.static('/Users/studio/Downloads/Guias: Guides',   { setHeaders: (res) => res.set('Access-Control-Allow-Origin', '*') }));
+
+// ── WebSocket server for real-time MIDI bridge ────────────────────────────────
+if (WebSocket) {
+  wss = new WebSocket.Server({ server: httpServer, path: '/midi/ws' });
+  wss.on('connection', (ws) => {
+    wsClients.add(ws);
+    ws.on('close',   () => wsClients.delete(ws));
+    ws.on('error',   () => wsClients.delete(ws));
+  });
+}
+function broadcastMidi(msg) {
+  if (!wsClients.size) return;
+  const data = JSON.stringify(msg);
+  wsClients.forEach(ws => { try { if (ws.readyState === 1) ws.send(data); } catch {} });
+}
+
+// ── POST /midi/command ────────────────────────────────────────────────────────
+// Receives MIDI-translated commands from Electron desktop bridge,
+// broadcasts to all connected Playback WebSocket clients.
+// Body: { type: 'MIDI_NEXT'|'MIDI_PREV'|'MIDI_PLAY'|'MIDI_STOP'|'MIDI_GOTO_SONG'|
+//               'MIDI_SECTION'|'MIDI_FADER'|'MIDI_PAN'|'MIDI_SONG_POSITION', ... }
+app.post('/midi/command', (req, res) => {
+  const cmd = req.body;
+  if (!cmd || !cmd.type) return res.status(400).json({ error: 'type required' });
+  broadcastMidi(cmd);
+  res.json({ ok: true, clients: wsClients.size });
+});
 
 // ── POST /sync/publish ───────────────────────────────────────────────────────
 app.post('/sync/publish', async (req, res) => {
   try {
     const body = req.body;
+    console.log(`[publish-in] services=${Array.isArray(body.services)?body.services.length:'?'} people=${Array.isArray(body.people)?body.people.length:'?'} plans=${Object.keys(body.plans||{}).length}`);
     if (body.services) {
       for (const svc of body.services) {
         const idx = store.services.findIndex(s => s.id === svc.id);
@@ -95,16 +185,50 @@ app.post('/sync/publish', async (req, res) => {
       }
     }
     if (body.plans) Object.assign(store.plans, body.plans);
+    if (body.vocalAssignments) {
+      if (!store.vocalAssignments) store.vocalAssignments = {};
+      Object.assign(store.vocalAssignments, body.vocalAssignments);
+    }
     await persist();
     console.log(`[publish] ${store.services.length} services, ${store.people.length} people`);
     res.json({ ok: true, services: store.services.length, people: store.people.length });
   } catch (e) { res.status(400).json({ error: e.message }); }
 });
 
-// ── GET /sync/assignments?email= ─────────────────────────────────────────────
+// ── POST /sync/song/patch ─────────────────────────────────────────────────────
+// Directly patch a single song field — used by ContentEditor admin Apply
+// Body: { serviceId, songId, field: 'lyrics'|'chordChart'|'instrumentNotes', value, instrument? }
+app.post('/sync/song/patch', async (req, res) => {
+  try {
+    const { serviceId, songId, field, value, instrument } = req.body;
+    if (!serviceId || !songId || !field) return res.status(400).json({ error: 'serviceId, songId and field are required' });
+    const plan = store.plans[serviceId];
+    if (!plan) return res.status(404).json({ error: 'Plan not found — publish from Musician first' });
+    const song = (plan.songs || []).find(s => s.id === songId);
+    if (!song) return res.status(404).json({ error: 'Song not found in plan' });
+    if (field === 'lyrics') {
+      song.lyrics    = value || '';
+      song.hasLyrics = !!(value && value.trim());
+    } else if (field === 'chordChart') {
+      song.chordChart = value || '';
+      song.chordSheet = value || '';
+    } else if (field === 'instrumentNotes' && instrument) {
+      if (!song.instrumentNotes) song.instrumentNotes = {};
+      song.instrumentNotes[instrument] = value || '';
+    } else {
+      return res.status(400).json({ error: `Unknown field "${field}"` });
+    }
+    await persist();
+    console.log(`[song/patch] svc=${serviceId} song=${songId} field=${field}${instrument?' instr='+instrument:''}`);
+    res.json({ ok: true });
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+
+// ── GET /sync/assignments?email=&name= ───────────────────────────────────────
 app.get('/sync/assignments', (req, res) => {
   const email  = req.query.email || '';
-  const person = findPerson(email);
+  const name   = req.query.name  || '';
+  const person = findPerson(email, name);
   const assignments = [];
   if (person) {
     const serviceMap = {};
@@ -118,17 +242,33 @@ app.get('/sync/assignments', (req, res) => {
       const team    = plan.team || [];
       const matches = team.filter(t => t.personId === person.id);
       if (matches.length > 0) {
+        // Compute explicit service_end_at = service date + time + 2 hours grace
+        let service_end_at = null;
+        const rawDate = svc.date || svc.serviceDate || '';
+        const rawTime = svc.time || svc.startTime || '';
+        if (rawDate) {
+          // Append T00:00:00 so JS parses as local time, not UTC midnight
+          const localStr = String(rawDate).includes('T') ? rawDate : `${rawDate}T00:00:00`;
+          const dt = new Date(localStr);
+          if (Number.isFinite(dt.getTime())) {
+            const m = String(rawTime).match(/(\d{1,2}):(\d{2})/);
+            if (m) dt.setHours(Number(m[1]), Number(m[2]), 0, 0);
+            else   dt.setHours(23, 59, 59, 999);
+            service_end_at = dt.toISOString();
+          }
+        }
         assignments.push({
-          id:           `${svc.id}_${person.id}`,
-          service_id:   svc.id,
-          service_name: svc.name || svc.title || 'Service',
-          service_date: svc.date,
-          service_time: svc.time || '',
-          service_type: svc.serviceType || 'standard',
-          role:         matches[0].role,
-          roles:        matches.map(m => m.role),
-          notes:        plan.notes || '',
-          status:       'pending',
+          id:             `${svc.id}_${person.id}`,
+          service_id:     svc.id,
+          service_name:   svc.name || svc.title || 'Service',
+          service_date:   svc.date || svc.serviceDate || '',
+          service_time:   svc.time || svc.startTime || '',
+          service_type:   svc.serviceType || 'standard',
+          service_end_at,
+          role:           matches[0].role,
+          roles:          matches.map(m => m.role),
+          notes:          plan.notes || '',
+          status:         'pending',
         });
       }
     }
@@ -410,8 +550,65 @@ app.get('/sync/song-library', (req, res) => {
   res.json(result);
 });
 
+// ── POST /sync/library-push — full device library → server ───────────────────
+// Body: { songs, people, services, plans, vocalAssignments, blockouts }
+app.post('/sync/library-push', async (req, res) => {
+  const { songs = [], people = [], services = [], plans = {}, vocalAssignments = {}, blockouts = [] } = req.body || {};
+  // Merge songs
+  for (const song of songs) {
+    if (song && song.id) store.songLibrary[song.id] = { ...song, updatedAt: new Date().toISOString() };
+  }
+  // Merge people
+  for (const person of people) {
+    if (!person || !person.id) continue;
+    const idx = store.people.findIndex(p => p.id === person.id);
+    if (idx >= 0) store.people[idx] = person; else store.people.push(person);
+  }
+  // Merge services
+  for (const svc of services) {
+    if (!svc || !svc.id) continue;
+    const idx = store.services.findIndex(s => s.id === svc.id);
+    if (idx >= 0) store.services[idx] = svc; else store.services.push(svc);
+  }
+  // Merge service plans { [serviceId]: planObject }
+  if (plans && typeof plans === 'object') Object.assign(store.plans, plans);
+  // Merge vocal assignments { [serviceId]: { [songId]: { ... } } }
+  if (vocalAssignments && typeof vocalAssignments === 'object') {
+    if (!store.vocalAssignments) store.vocalAssignments = {};
+    Object.assign(store.vocalAssignments, vocalAssignments);
+  }
+  // Merge blockouts (avoid duplicates by email+date)
+  if (!store.blockouts) store.blockouts = [];
+  for (const b of blockouts) {
+    if (!b || !b.email || !b.date) continue;
+    const exists = store.blockouts.find(x => x.email === b.email && x.date === b.date);
+    if (!exists) store.blockouts.push(b);
+  }
+  await persist();
+  console.log(`[library-push] songs=${Object.keys(store.songLibrary).length} people=${store.people.length} services=${store.services.length} plans=${Object.keys(store.plans).length}`);
+  res.json({ ok: true, songs: Object.keys(store.songLibrary).length, people: store.people.length, services: store.services.length, plans: Object.keys(store.plans).length });
+});
+
+// ── GET /sync/library-pull — server → device ─────────────────────────────────
+app.get('/sync/library-pull', (req, res) => {
+  res.json({
+    songs:             Object.values(store.songLibrary || {}),
+    people:            store.people || [],
+    services:          store.services || [],
+    plans:             store.plans || {},
+    vocalAssignments:  store.vocalAssignments || {},
+    blockouts:         store.blockouts || [],
+  });
+});
+
 // ── GET /sync/debug ──────────────────────────────────────────────────────────
+// Returns full store so ContentEditor admin Apply can read → patch → republish
 app.get('/sync/debug', (req, res) => res.json({
+  services: store.services,
+  people:   store.people,
+  plans:    store.plans,
+  messages: store.messages.length,
+}));
 
 // ── POST /sync/stems/zip ─────────────────────────────────────────────────────
 const multer = require("multer");
@@ -479,9 +676,6 @@ app.post("/sync/stems/zip", upload.single("zip"), async (req, res) => {
   }
 });
 
-  people: store.people, services: store.services, plans: store.plans,
-}));
-
 // ── GET /sync/status  (health check) ────────────────────────────────────────
 app.get('/sync/status', (req, res) => res.json({
   ok: true, service: 'UltimateSync', version: '3.0.0',
@@ -494,10 +688,11 @@ app.get('/health', (req, res) => res.json({ status: 'ok', service: 'UltimateSync
 
 // ── Boot ─────────────────────────────────────────────────────────────────────
 initDB().then(() => {
-  app.listen(PORT, () => {
+  httpServer.listen(PORT, () => {
     console.log(`\n🎵 Ultimate Sync Server v3.0`);
     console.log(`   http://localhost:${PORT}`);
-    console.log(`   DB: PostgreSQL ✅`);
+    if (WebSocket) console.log(`   ws://localhost:${PORT}/midi/ws  ← MIDI bridge`);
+    console.log(`   DB: ${pool ? 'PostgreSQL ✅' : 'in-memory'}`);
     console.log(`   Mode: ${process.env.NODE_ENV === 'production' ? '🔴 PRODUCTION' : '🟡 development'}\n`);
   });
 }).catch(e => {
