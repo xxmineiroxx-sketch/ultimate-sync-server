@@ -187,7 +187,12 @@ app.post('/sync/publish', async (req, res) => {
     if (body.plans) Object.assign(store.plans, body.plans);
     if (body.vocalAssignments) {
       if (!store.vocalAssignments) store.vocalAssignments = {};
-      Object.assign(store.vocalAssignments, body.vocalAssignments);
+      // Store per-serviceId so Playback can look up lib.vocalAssignments[serviceId]
+      if (body.serviceId) {
+        store.vocalAssignments[body.serviceId] = body.vocalAssignments;
+      } else {
+        Object.assign(store.vocalAssignments, body.vocalAssignments);
+      }
     }
     await persist();
     console.log(`[publish] ${store.services.length} services, ${store.people.length} people`);
@@ -521,14 +526,61 @@ app.get('/sync/blockouts', (req, res) => {
 // ── POST /sync/assignment/respond ────────────────────────────────────────────
 app.post('/sync/assignment/respond', async (req, res) => {
   try {
-    const { assignmentId, email, status } = req.body;
-    if (!assignmentId || !email) return res.status(400).json({ error: 'assignmentId and email required' });
+    // Accept both formats:
+    //   Old: { assignmentId, email, status }
+    //   Playback: { serviceId, personId (= email), response, role }
+    let { assignmentId, email, status, serviceId, personId, response, role } = req.body;
+    email  = (email  || personId || '').trim().toLowerCase();
+    status = status  || response || 'pending';
+    if (!email) return res.status(400).json({ error: 'email or personId required' });
+    if (!assignmentId && serviceId) assignmentId = `${serviceId}_${email}`;
+    if (!assignmentId) return res.status(400).json({ error: 'assignmentId or serviceId required' });
+
     if (!store.assignmentResponses) store.assignmentResponses = {};
     store.assignmentResponses[assignmentId] = {
-      email: email.trim().toLowerCase(),
-      status: status || 'pending',
-      updatedAt: new Date().toISOString(),
+      email, status, updatedAt: new Date().toISOString(),
     };
+
+    // Also write status directly into the plan's team record so library-pull reflects it
+    const personName = req.body.name || req.body.personName || email;
+    let serviceName = serviceId || '';
+    if (serviceId && store.plans && store.plans[serviceId]) {
+      const plan = store.plans[serviceId];
+      serviceName = plan.title || plan.name || serviceId;
+      if (Array.isArray(plan.team)) {
+        plan.team = plan.team.map(tm => {
+          const tmEmail = (tm.email || tm.personId || '').toLowerCase();
+          if (tmEmail === email && (!role || tm.role === role)) {
+            return { ...tm, status };
+          }
+          return tm;
+        });
+        store.plans[serviceId] = plan;
+      }
+    }
+
+    // Auto-create notification message to admin
+    const statusEmoji  = status === 'accepted' ? '✅' : status === 'declined' ? '❌' : '⏳';
+    const declineReason = req.body.declineReason || req.body.reason || '';
+    let msgBody = `${statusEmoji} ${personName} ${status === 'accepted' ? 'accepted' : status === 'declined' ? 'declined' : 'responded to'} the assignment`;
+    if (role) msgBody += ` (${role})`;
+    msgBody += ` for "${serviceName}".`;
+    if (declineReason) msgBody += `\n\n💬 Reason: ${declineReason}`;
+    store.messages = store.messages || [];
+    store.messages.unshift({
+      id:         `msg_${Date.now()}_${Math.random().toString(36).substr(2,6)}`,
+      from_email: email,
+      from_name:  personName,
+      subject:    `${statusEmoji} Assignment ${status}: ${personName}`,
+      message:    msgBody,
+      to:         'admin',
+      timestamp:  new Date().toISOString(),
+      read:       false,
+      replies:    [],
+      isSystemMsg: true,
+      metadata:   { serviceId, status, role, personEmail: email },
+    });
+
     await persist();
     res.json({ ok: true });
   } catch (e) { res.status(400).json({ error: e.message }); }
