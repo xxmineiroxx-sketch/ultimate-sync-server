@@ -700,30 +700,56 @@ app.get('/sync/song-library', (req, res) => {
 });
 
 // ── POST /sync/library-push — full device library → server ───────────────────
-// Body: { songs, people, services, plans, vocalAssignments, blockouts }
+// Body: { songs, people, services, plans, vocalAssignments, blockouts,
+//         replacePeopleSnapshot, replaceServicesSnapshot, replacePlansSnapshot,
+//         replaceVocalAssignmentsSnapshot }
+// When a replace* flag is true the server REPLACES the entire collection instead
+// of merging — this is how admin deletes are honoured permanently.
 app.post('/sync/library-push', async (req, res) => {
-  const { songs = [], people = [], services = [], plans = {}, vocalAssignments = {}, blockouts = [] } = req.body || {};
-  // Merge songs
+  const {
+    songs = [], people = [], services = [], plans = {}, vocalAssignments = {}, blockouts = [],
+    replacePeopleSnapshot, replaceServicesSnapshot, replacePlansSnapshot, replaceVocalAssignmentsSnapshot,
+  } = req.body || {};
+
+  // Songs — always merge (no delete semantics for songs yet)
   for (const song of songs) {
     if (song && song.id) store.songLibrary[song.id] = { ...song, updatedAt: new Date().toISOString() };
   }
-  // Merge people
-  for (const person of people) {
-    if (!person || !person.id) continue;
-    const idx = store.people.findIndex(p => p.id === person.id);
-    if (idx >= 0) store.people[idx] = person; else store.people.push(person);
+
+  // People — replace entire list when flag is set (honours admin deletes)
+  if (replacePeopleSnapshot) {
+    store.people = people.filter(p => p && p.id);
+  } else {
+    for (const person of people) {
+      if (!person || !person.id) continue;
+      const idx = store.people.findIndex(p => p.id === person.id);
+      if (idx >= 0) store.people[idx] = person; else store.people.push(person);
+    }
   }
-  // Merge services
-  for (const svc of services) {
-    if (!svc || !svc.id) continue;
-    const idx = store.services.findIndex(s => s.id === svc.id);
-    if (idx >= 0) store.services[idx] = svc; else store.services.push(svc);
+
+  // Services — replace or merge
+  if (replaceServicesSnapshot) {
+    store.services = services.filter(s => s && s.id);
+  } else {
+    for (const svc of services) {
+      if (!svc || !svc.id) continue;
+      const idx = store.services.findIndex(s => s.id === svc.id);
+      if (idx >= 0) store.services[idx] = svc; else store.services.push(svc);
+    }
   }
-  // Merge service plans { [serviceId]: planObject }
-  if (plans && typeof plans === 'object') Object.assign(store.plans, plans);
-  // Merge vocal assignments { [serviceId]: { [songId]: { ... } } }
-  if (vocalAssignments && typeof vocalAssignments === 'object') {
-    if (!store.vocalAssignments) store.vocalAssignments = {};
+
+  // Plans — replace or merge
+  if (replacePlansSnapshot) {
+    if (plans && typeof plans === 'object') store.plans = plans;
+  } else {
+    if (plans && typeof plans === 'object') Object.assign(store.plans, plans);
+  }
+
+  // Vocal assignments — replace or merge
+  if (!store.vocalAssignments) store.vocalAssignments = {};
+  if (replaceVocalAssignmentsSnapshot) {
+    if (vocalAssignments && typeof vocalAssignments === 'object') store.vocalAssignments = vocalAssignments;
+  } else if (vocalAssignments && typeof vocalAssignments === 'object') {
     Object.assign(store.vocalAssignments, vocalAssignments);
   }
   // Merge blockouts (avoid duplicates by email+date)
