@@ -316,6 +316,68 @@ app.get('/sync/assignments', (req, res) => {
   res.json(assignments);
 });
 
+// ── POST /sync/heartbeat — member check-in ───────────────────────────────────
+// Called by every Playback device on HomeScreen load.
+// Body: { serviceId, email, name, role }
+app.post('/sync/heartbeat', async (req, res) => {
+  const { serviceId, email, name, role } = req.body || {};
+  if (!serviceId || !email) return res.status(400).json({ error: 'serviceId and email required' });
+  if (!store.heartbeats) store.heartbeats = {};
+  if (!store.heartbeats[serviceId]) store.heartbeats[serviceId] = {};
+  store.heartbeats[serviceId][email.toLowerCase().trim()] = {
+    name: name || email,
+    role: role || '',
+    lastSeen: new Date().toISOString(),
+  };
+  await persist();
+  res.json({ ok: true });
+});
+
+// ── GET /sync/team-pulse?serviceId= — worship leader team readiness ───────────
+// Returns every member assigned to the service with their last heartbeat time.
+// Members in plan.team who haven't sent a heartbeat are included as 'not seen'.
+app.get('/sync/team-pulse', (req, res) => {
+  const serviceId = req.query.serviceId || '';
+  const plan      = store.plans[serviceId] || {};
+  const team      = plan.team || [];
+  const beats     = (store.heartbeats || {})[serviceId] || {};
+
+  // Start with plan.team so even members who haven't opened the app are listed
+  const memberMap = {};
+  for (const t of team) {
+    const key = (t.email || t.name || t.personId || '').toLowerCase().trim();
+    if (!key) continue;
+    memberMap[key] = {
+      name:     t.name || t.email || key,
+      role:     t.role || '',
+      lastSeen: null,
+    };
+  }
+  // Overlay actual heartbeat times
+  for (const [emailKey, beat] of Object.entries(beats)) {
+    if (memberMap[emailKey]) {
+      memberMap[emailKey].lastSeen = beat.lastSeen;
+      if (beat.role) memberMap[emailKey].role = beat.role;
+    } else {
+      // Member checked in but wasn't in plan.team — still show them
+      memberMap[emailKey] = {
+        name:     beat.name,
+        role:     beat.role,
+        lastSeen: beat.lastSeen,
+      };
+    }
+  }
+
+  const result = Object.values(memberMap).sort((a, b) => {
+    // Active/synced first, then by name
+    const sa = a.lastSeen ? new Date(a.lastSeen).getTime() : 0;
+    const sb = b.lastSeen ? new Date(b.lastSeen).getTime() : 0;
+    return sb - sa;
+  });
+
+  res.json(result);
+});
+
 // ── GET /sync/setlist?serviceId= ─────────────────────────────────────────────
 app.get('/sync/setlist', (req, res) => {
   const plan  = store.plans[req.query.serviceId || ''] || { songs: [] };
