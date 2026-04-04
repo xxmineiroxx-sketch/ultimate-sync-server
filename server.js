@@ -722,8 +722,21 @@ app.post('/sync/library-push', async (req, res) => {
   } else {
     for (const person of people) {
       if (!person || !person.id) continue;
-      const idx = store.people.findIndex(p => p.id === person.id);
-      if (idx >= 0) store.people[idx] = person; else store.people.push(person);
+      // Match by ID first, then by email — prevents cross-app duplicates where
+      // UM and Playback generate different UUIDs for the same person
+      let idx = store.people.findIndex(p => p.id === person.id);
+      if (idx < 0 && person.email) {
+        const emailLower = person.email.toLowerCase().trim();
+        idx = store.people.findIndex(p =>
+          emailLower && (p.email || '').toLowerCase().trim() === emailLower
+        );
+      }
+      if (idx >= 0) {
+        // Preserve the original server-side ID so existing team assignments stay valid
+        store.people[idx] = { ...store.people[idx], ...person, id: store.people[idx].id };
+      } else {
+        store.people.push(person);
+      }
     }
   }
 
