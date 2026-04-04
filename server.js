@@ -185,6 +185,10 @@ app.post('/sync/publish', async (req, res) => {
       }
     }
     if (body.plans) Object.assign(store.plans, body.plans);
+    // UM sends { serviceId, plan } (singular) — store it so /sync/assignments can read team
+    if (body.serviceId && body.plan) {
+      store.plans[body.serviceId] = body.plan;
+    }
     if (body.vocalAssignments) {
       if (!store.vocalAssignments) store.vocalAssignments = {};
       // Store per-serviceId so Playback can look up lib.vocalAssignments[serviceId]
@@ -235,7 +239,37 @@ app.get('/sync/assignments', (req, res) => {
   const name   = req.query.name  || '';
   const person = findPerson(email, name);
   const assignments = [];
-  if (person) {
+
+  // Build a set of all IDs that could represent this person across apps.
+  // UM and Playback may have different UUIDs for the same person — match by
+  // email (exact) or normalized name as fallback so cross-app sync works.
+  function teamEntryMatchesPerson(t) {
+    if (!person) return false;
+    if (t.personId === person.id) return true;
+    // Email match — team entry now carries email since the UM fix
+    const te = (t.email || '').trim().toLowerCase();
+    const pe = (person.email || '').trim().toLowerCase();
+    if (te && pe && te === pe) return true;
+    // Name match (normalized) — last resort
+    const tn = (t.name || '').trim().toLowerCase();
+    const pn = (person.name || '').trim().toLowerCase();
+    if (tn && pn && normName(tn) === normName(pn)) return true;
+    return false;
+  }
+
+  // Also match directly by the query email/name against team entries,
+  // even if store.people doesn't have this person yet (UM may not have pushed people)
+  const qEmail = email.trim().toLowerCase();
+  const qName  = name.trim().toLowerCase();
+  function teamEntryMatchesQuery(t) {
+    const te = (t.email || '').trim().toLowerCase();
+    const tn = (t.name  || '').trim().toLowerCase();
+    if (qEmail && te && te === qEmail) return true;
+    if (qName  && tn && normName(tn) === normName(qName)) return true;
+    return false;
+  }
+
+  if (email || name) {
     const serviceMap = {};
     for (const svc of store.services) serviceMap[svc.id] = svc;
     for (const planId of Object.keys(store.plans)) {
@@ -245,7 +279,7 @@ app.get('/sync/assignments', (req, res) => {
     for (const svc of Object.values(serviceMap)) {
       const plan    = store.plans[svc.id] || {};
       const team    = plan.team || [];
-      const matches = team.filter(t => t.personId === person.id);
+      const matches = team.filter(t => teamEntryMatchesPerson(t) || teamEntryMatchesQuery(t));
       if (matches.length > 0) {
         // Compute explicit service_end_at = service date + time + 2 hours grace
         let service_end_at = null;
@@ -262,8 +296,9 @@ app.get('/sync/assignments', (req, res) => {
             service_end_at = dt.toISOString();
           }
         }
+        const personKey = person?.id || qEmail || qName || 'unknown';
         assignments.push({
-          id:             `${svc.id}_${person.id}`,
+          id:             `${svc.id}_${personKey}`,
           service_id:     svc.id,
           service_name:   svc.name || svc.title || 'Service',
           service_date:   svc.date || svc.serviceDate || '',
